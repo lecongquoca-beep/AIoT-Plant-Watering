@@ -23,9 +23,7 @@ ChartJS.register(
 // Có thể ghi đè bằng biến VITE_API_URL.
 const API = (
   import.meta.env.VITE_API_URL ||
-  (import.meta.env.DEV
-    ? 'http://127.0.0.1:8000'
-    : 'https://es-design.onrender.com')
+  'https://es-design.onrender.com'
 ).replace(/\/+$/, '');
 
 const DEVICE = import.meta.env.VITE_DEVICE_ID || 'esp32_v1';
@@ -270,10 +268,23 @@ export default function App() {
 
         if (stopped) return;
 
-        setSnapshot({ ...result, fetchedAt: Date.now() });
+        const item = result.data?.simulated === false
+          ? result.data
+          : null;
+
+        setSnapshot({
+          ...result,
+          data: item,
+          fetchedAt: Date.now(),
+        });
+
         setApiError('');
 
-        const item = result.data;
+        if (!item) {
+          setSamples([]);
+          lastDevice.current = null;
+          lastAI.current = null;
+        }
 
         if (item) {
           const deviceState = [
@@ -367,9 +378,15 @@ export default function App() {
       }
 
       setHistory(previous => {
+        const realRows = result.data.filter(
+          item => item.simulated === false
+        );
+
         const merged = older
-          ? [...result.data, ...previous]
-          : result.data;
+          ? [...realRows, ...previous].filter(
+              item => item.simulated === false
+            )
+          : realRows;
 
         return [...new Map(
           merged.map(item => [item.sample_id, item])
@@ -469,7 +486,9 @@ export default function App() {
     };
   }, [command, logEvent]);
 
-  const data = snapshot?.data;
+  const data = snapshot?.data?.simulated === false
+    ? snapshot.data
+    : null;
 
   const age = Number.isFinite(data?.dataAgeSeconds)
     ? data.dataAgeSeconds +
@@ -559,59 +578,91 @@ export default function App() {
     ? new Date(data.predictionInputAt).getTime()
     : NaN;
 
+  const predictionTargetTime = data?.predictionTargetAt
+    ? new Date(data.predictionTargetAt).getTime()
+    : NaN;
+
   const predictionAge = Number.isFinite(predictionTime)
     ? (clock - predictionTime) / 1000
     : null;
 
-  const predictionReady =
-    online &&
-    data?.aiReady === true &&
-    data?.soilPredictionSource === 'lstm_csv_huber' &&
-    predictionAge !== null &&
-    predictionAge >= -10 &&
-    predictionAge <= 90 &&
+  const correctSource =
+    data?.soilPredictionSource === 'esp32_week2' &&
+    data?.lightPredictionSource === 'esp32_week2';
+
+  const correctHorizon =
+    data?.predictionHorizonMinutes === 60 &&
+    Number.isFinite(predictionTime) &&
+    Number.isFinite(predictionTargetTime) &&
+    Math.abs(
+      predictionTargetTime - predictionTime - 60 * 60 * 1000
+    ) <= 2000;
+
+  const validSoil =
     Number.isFinite(data?.predictedSoil) &&
     data.predictedSoil >= 0 &&
     data.predictedSoil <= 100;
 
-  const lightReady =
-    predictionReady &&
-    data?.lightPredictionSource === 'persistence' &&
+  const validLight =
     Number.isFinite(data?.predictedLight) &&
-    data.predictedLight >= 0;
+    data.predictedLight >= 0 &&
+    data.predictedLight <= 200000;
+
+  const predictionReady =
+    online &&
+    data?.simulated === false &&
+    data?.aiReady === true &&
+    !data?.fault &&
+    data?.fsm !== 'FAULT' &&
+    correctSource &&
+    correctHorizon &&
+    predictionAge !== null &&
+    predictionAge >= -10 &&
+    predictionAge <= 90 &&
+    validSoil &&
+    validLight;
+
+  const lightReady = predictionReady;
 
   const backendMessage = typeof data?.aiMessage === 'string'
     ? data.aiMessage.trim()
     : '';
 
-  let aiTitle = 'Đang chờ dữ liệu AI';
-  let aiMessage = 'Chưa nhận được trạng thái AI từ backend.';
+  let aiTitle = 'Đang chờ AI từ ESP32';
+  let aiMessage = 'Chờ kit gửi kết quả dự đoán.';
 
   if (apiError) {
-    aiTitle = 'Chưa kết nối được AI';
-    aiMessage = 'Không đọc được backend. Tạm ẩn các dự đoán cũ.';
+    aiTitle = 'Chưa kết nối được backend';
+    aiMessage = 'Tạm ẩn dự đoán cho đến khi kết nối được khôi phục.';
   } else if (!data) {
-    aiTitle = 'Chưa có dữ liệu thiết bị';
-    aiMessage = 'Chờ backend nhận bản tin đầu tiên.';
+    aiTitle = 'Đang chờ phần cứng thật';
+    aiMessage =
+      'Chưa nhận được bản tin cảm biến thật từ ESP32. ' +
+      'Hãy bật kit và kết nối Wi-Fi, MQTT.';
   } else if (!online) {
     aiTitle = 'Đang chờ dữ liệu mới';
-    aiMessage = 'Thiết bị hoặc kết nối chưa sẵn sàng để hiển thị dự đoán.';
+    aiMessage =
+      'Thiết bị hoặc kết nối đang gián đoạn. ' +
+      'Dự đoán cũ được tạm ẩn.';
+  } else if (data.fault || data.fsm === 'FAULT') {
+    aiTitle = 'Thiết bị đang báo lỗi';
+    aiMessage = data.fault || backendMessage ||
+      'Chờ kit xử lý lỗi trước khi hiển thị dự đoán.';
   } else if (data.aiReady !== true) {
-    aiTitle = backendMessage.includes('ngoài phạm vi')
-      ? 'Dữ liệu ngoài phạm vi huấn luyện'
-      : backendMessage.includes('gián đoạn')
-        ? 'Dữ liệu đang bị gián đoạn'
-        : 'AI chưa sẵn sàng';
-    aiMessage = backendMessage || 'Backend chưa có dự đoán phù hợp.';
-  } else if (data.soilPredictionSource !== 'lstm_csv_huber') {
-    aiTitle = 'Chưa xác nhận nguồn dự đoán';
-    aiMessage = 'Backend chưa trả nguồn LSTM Huber. Kiểm tra phiên bản backend.';
+    aiTitle = 'AI trên kit chưa sẵn sàng';
+    aiMessage = backendMessage ||
+      'ESP32 đang thu thập dữ liệu hoặc chưa chạy được mô hình.';
+  } else if (!correctSource) {
+    aiTitle = 'Chưa xác nhận nguồn AI Week 2';
+    aiMessage =
+      'Cần bản tin có nguồn esp32_week2 cho cả độ ẩm và ánh sáng.';
   } else if (!predictionReady) {
     aiTitle = 'Đang chờ dự đoán hợp lệ';
-    aiMessage = 'Dự đoán đã cũ, thiếu thời điểm hoặc có giá trị không hợp lệ.';
+    aiMessage =
+      'Dự đoán đã cũ, thiếu thời điểm hoặc có giá trị không hợp lệ.';
   } else {
-    aiTitle = 'Dự đoán LSTM đã sẵn sàng';
-    aiMessage = backendMessage || 'Độ ẩm được dự đoán trên backend.';
+    aiTitle = 'AI trên ESP32 đã sẵn sàng';
+    aiMessage = 'Độ ẩm đất và ánh sáng được dự đoán bởi mô hình Week 2 trên kit.';
   }
 
   const heroTitle = !online
@@ -826,7 +877,7 @@ export default function App() {
                       ? 'Cảm biến thực tế'
                       : 'Chờ dữ liệu'}
                 </span>
-                <span>AI xử lý trên backend</span>
+                <span>AI chạy trên ESP32 · Week 2</span>
               </div>
             </div>
 
@@ -851,7 +902,7 @@ export default function App() {
               <Icon name="alert" />
               <span>
                 Không đọc được API: {apiError}.
-                {data ? ' Đang hiển thị số đo gần nhất đã nhận.' : ''}
+                {' Tạm ẩn số đo trực tiếp và khóa điều khiển.'}
               </span>
             </div>
           )}
@@ -874,12 +925,12 @@ export default function App() {
                   <div className="garden-sensor-icon"><Icon name={item.icon} /></div>
                 </div>
                 <div className="garden-sensor-value">
-                  {fmt(data?.[item.key], item.digits)}
+                  {online ? fmt(data?.[item.key], item.digits) : '—'}
                   <small>{item.unit}</small>
                 </div>
                 <div className="garden-meter">
                   <span style={{
-                    width: `${Number.isFinite(data?.[item.key])
+                    width: `${online && Number.isFinite(data?.[item.key])
                       ? Math.min(100, Math.max(0, data[item.key] / item.max * 100))
                       : 0}%`,
                   }} />
@@ -1005,7 +1056,7 @@ export default function App() {
                         <p>
                           {tab === 'history'
                             ? 'Bấm tải lại để đọc dữ liệu từ backend.'
-                            : 'Chờ thiết bị hoặc bộ giả lập gửi dữ liệu.'}
+                            : 'Chờ ESP32 gửi dữ liệu cảm biến thật.'}
                         </p>
                       </div>
                     )}
@@ -1089,7 +1140,7 @@ export default function App() {
                     <div>
                       <div className="garden-overline">PREDICTIVE INSIGHT</div>
                       <h2>Nhìn trước {data?.predictionHorizonMinutes ?? 60} phút</h2>
-                      <p>LSTM dự đoán độ ẩm đất. Ánh sáng dùng baseline giữ nguyên số đo.</p>
+                      <p>Mô hình Week 2 trên ESP32 dự đoán độ ẩm đất và ánh sáng.</p>
                     </div>
                   </div>
 
@@ -1110,21 +1161,21 @@ export default function App() {
                         <small> %</small>
                       </strong>
                       <p>
-                        {data?.soilPredictionSource === 'lstm_csv_huber'
-                          ? 'LSTM Huber chạy trên backend'
+                        {data?.soilPredictionSource === 'esp32_week2'
+                          ? 'Mô hình Week 2 chạy trên ESP32'
                           : 'Chưa xác nhận nguồn dự đoán'}
                       </p>
                     </div>
                     <div className="garden-prediction light">
                       <Icon name="sun" size={28} />
-                      <span>Ánh sáng · Baseline</span>
+                      <span>Ánh sáng · AI trên ESP32</span>
                       <strong>
                         {lightReady ? fmt(data.predictedLight, 0) : '—'}
                         <small> Lux</small>
                       </strong>
                       <p>
-                        {data?.lightPredictionSource === 'persistence'
-                          ? 'Giữ nguyên số đo tại thời điểm dự báo'
+                        {data?.lightPredictionSource === 'esp32_week2'
+                          ? 'Mô hình Week 2 chạy trên ESP32'
                           : 'Chưa xác nhận nguồn dự báo'}
                       </p>
                     </div>
@@ -1132,11 +1183,15 @@ export default function App() {
 
                   <div className="garden-detail">
                     <span>Thời điểm đầu vào</span>
-                    <strong>{dateText(data?.predictionInputAt)}</strong>
+                    <strong>
+                      {predictionReady ? dateText(data.predictionInputAt) : '—'}
+                    </strong>
                   </div>
                   <div className="garden-detail">
                     <span>Thời điểm được dự báo</span>
-                    <strong>{dateText(data?.predictionTargetAt)}</strong>
+                    <strong>
+                      {predictionReady ? dateText(data.predictionTargetAt) : '—'}
+                    </strong>
                   </div>
                   <div className="garden-detail">
                     <span>Trạng thái dự đoán</span>
@@ -1146,9 +1201,11 @@ export default function App() {
                   <div className="garden-ai-explanation">
                     <Icon name="leaf" size={20} />
                     <p>
-                      Mô hình học từ CSV có dữ liệu tổng hợp dựa trên thực nghiệm.
-                      Dự đoán hiện dùng để theo dõi, chưa tự quyết định bật bơm.
-                      Độ chính xác với cảm biến thật cần được kiểm chứng riêng.
+                      Mô hình Week 2 chạy trực tiếp trên ESP32.
+                      Trong chế độ AUTO, firmware kết hợp điều kiện cảm biến
+                      và dự đoán để điều khiển tưới.
+                      Backend chuyển tiếp dữ liệu và lệnh điều khiển.
+                      Độ chính xác của mô hình với cảm biến thật chưa được xác nhận.
                     </p>
                   </div>
                 </section>
