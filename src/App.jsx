@@ -26,6 +26,10 @@ const API = (
 
 const DEVICE = import.meta.env.VITE_DEVICE_ID || 'esp32_v1';
 
+// Khóa điều khiển cài sẵn qua biến môi trường VITE_CONTROL_API_KEY.
+// Để trống thì giao diện vẫn hiện ô nhập khóa như cũ.
+const PRESET_API_KEY = (import.meta.env.VITE_CONTROL_API_KEY || '').trim();
+
 const METRICS = [
   {
     key: 'soilMoisture',
@@ -111,14 +115,16 @@ async function request(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
     ...options,
     cache: 'no-store',
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(options.timeout || 30000),
   });
 
   let body;
   try {
     body = await response.json();
   } catch {
-    throw new Error(`API không trả JSON hợp lệ (${response.status}).`);
+    throw new Error(
+      `Máy chủ chưa sẵn sàng (mã ${response.status}, phản hồi không phải JSON; có thể đang khởi động lại).`
+    );
   }
 
   if (!response.ok) {
@@ -224,7 +230,7 @@ export default function App() {
   const [tab, setTab] = useState('live');
   const [metric, setMetric] = useState('all');
   const [settings, setSettings] = useState(false);
-  const [apiKey, setApiKey] = useState('');
+  const [apiKey, setApiKey] = useState(PRESET_API_KEY);
 
   const [sending, setSending] = useState(false);
   const [command, setCommand] = useState(null);
@@ -257,12 +263,9 @@ export default function App() {
     let stopped = false;
     let timer;
 
-    async function poll() {
-      try {
-        const result = await request(
-          `/api/telemetry/latest?device_id=${encodeURIComponent(DEVICE)}`
-        );
+    let lastSampledMs = 0;
 
+    function applyLatest(result) {
         if (result.status !== 'success') {
           throw new Error('API chưa trả dữ liệu hợp lệ.');
         }
@@ -272,6 +275,13 @@ export default function App() {
         const item = result.data?.simulated === false
           ? result.data
           : null;
+
+        // Bỏ qua bản cũ hơn bản đã hiển thị (SSE và polling có thể đến lệch thứ tự)
+        const sampledMs = item ? Date.parse(item.sampled_at || item.time) : NaN;
+        if (Number.isFinite(sampledMs)) {
+          if (sampledMs < lastSampledMs) return;
+          lastSampledMs = sampledMs;
+        }
 
         setSnapshot({
           ...result,
@@ -341,20 +351,111 @@ export default function App() {
             return [...previous, item].slice(-60);
           });
         }
+    }
+
+    // Tự phục hồi: lỗi thoáng qua không xóa dữ liệu đang hiển thị; chỉ báo lỗi sau 3 lần liên tiếp,
+    // và luôn tự thử lại (giãn dần 2s -> 10s) cho tới khi máy chủ trả lời lại.
+    let failures = 0;
+    let busy = false;
+
+    async function poll() {
+      if (busy || stopped) return;
+      busy = true;
+      clearTimeout(timer);
+
+      try {
+        const result = await request(
+          `/api/telemetry/latest?device_id=${encodeURIComponent(DEVICE)}`,
+          { timeout: 8000 }
+        );
+
+        applyLatest(result);
+        failures = 0;
       } catch (error) {
-        if (!stopped) setApiError(error.message);
+        failures += 1;
+
+        if (!stopped && failures >= 3) {
+          setApiError(`${error.message} Đang tự kết nối lại…`);
+        }
       } finally {
-        if (!stopped) timer = setTimeout(poll, 2000);
+        busy = false;
+
+        if (!stopped) {
+          timer = setTimeout(
+            poll,
+            Math.min(2000 * 2 ** Math.min(failures, 3), 10000)
+          );
+        }
       }
     }
 
     poll();
     const tick = setInterval(() => setClock(Date.now()), 1000);
 
+    // Nhận bản tin ngay khi ESP32 gửi (SSE). Polling vẫn chạy làm dự phòng.
+    // EventSource tự nối lại khi mất kết nối thoáng qua, nhưng nếu máy chủ trả 502/503
+    // (đang khởi động lại) nó đóng hẳn -> ta tự tạo lại với thời gian chờ tăng dần.
+    let source = null;
+    let sseTimer;
+    let sseFails = 0;
+
+    function connectSSE() {
+      if (stopped) return;
+
+      try {
+        source = new EventSource(
+          `${API}/api/telemetry/stream?device_id=${encodeURIComponent(DEVICE)}`
+        );
+
+        source.onopen = () => {
+          sseFails = 0;
+        };
+
+        source.onmessage = event => {
+          try {
+            applyLatest(JSON.parse(event.data));
+          } catch {
+            /* bỏ qua bản tin lỗi, polling sẽ bù */
+          }
+        };
+
+        source.onerror = () => {
+          if (source && source.readyState === EventSource.CLOSED) {
+            source.close();
+            source = null;
+            sseFails += 1;
+            sseTimer = setTimeout(
+              connectSSE,
+              Math.min(2000 * 2 ** Math.min(sseFails, 4), 30000)
+            );
+          }
+        };
+      } catch {
+        sseTimer = setTimeout(connectSSE, 5000);
+      }
+    }
+
+    connectSSE();
+
+    // Tab nền bị trình duyệt làm chậm timer; quay lại tab hoặc có mạng lại thì lấy dữ liệu ngay
+    function wake() {
+      if (document.visibilityState === 'visible') {
+        failures = 0;
+        poll();
+      }
+    }
+
+    document.addEventListener('visibilitychange', wake);
+    window.addEventListener('online', wake);
+
     return () => {
       stopped = true;
       clearTimeout(timer);
+      clearTimeout(sseTimer);
       clearInterval(tick);
+      document.removeEventListener('visibilitychange', wake);
+      window.removeEventListener('online', wake);
+      if (source) source.close();
     };
   }, [logEvent]);
 
@@ -846,6 +947,7 @@ export default function App() {
                 <p>Khóa chỉ giữ trong bộ nhớ trang, không lưu sau khi tải lại.</p>
                 <p className="garden-api-address">API: {API}</p>
               </div>
+              {!PRESET_API_KEY && (
               <label className="garden-key">
                 <span>Khóa điều khiển</span>
                 <input
@@ -856,6 +958,7 @@ export default function App() {
                   onChange={event => setApiKey(event.target.value)}
                 />
               </label>
+              )}
               <button className="garden-soft-button" onClick={() => setSettings(false)}>
                 Đóng
               </button>
@@ -1291,6 +1394,7 @@ export default function App() {
                 })}
               </div>
 
+              {!PRESET_API_KEY && (
               <label className="garden-key">
                 <span><Icon name="lock" size={16} />Khóa điều khiển</span>
                 <input
@@ -1301,10 +1405,13 @@ export default function App() {
                   onChange={event => setApiKey(event.target.value)}
                 />
               </label>
+              )}
 
+              {!PRESET_API_KEY && (
               <p className="garden-key-note">
                 Khóa chỉ giữ trong phiên hiện tại và được kiểm tra khi gửi lệnh.
               </p>
+              )}
 
               <button
                 className="garden-water-button"
