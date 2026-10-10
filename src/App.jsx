@@ -217,6 +217,683 @@ function Icon({ name, size = 22 }) {
   );
 }
 
+function PlantPot3D({ data, online }) {
+  const [angle, setAngle] = useState(-12);
+  const [watering, setWatering] = useState({
+    phase: 'idle',
+    before: null,
+    after: null,
+  });
+
+  const previous = useRef(null);
+  const cycle = useRef(null);
+
+  const real = data?.simulated === false;
+  const validSoil =
+    online &&
+    real &&
+    Number.isFinite(data?.soilMoisture) &&
+    data.soilMoisture >= 0 &&
+    data.soilMoisture <= 100;
+
+  const moisture = validSoil ? data.soilMoisture : null;
+  const pumping = online && real && data?.pump === 'ON';
+
+  const waterMissing =
+    online &&
+    (
+      data?.waterAvailable === false ||
+      String(data?.fault || '').trim().toUpperCase() ===
+        'NO WATER (FLOAT)'
+    );
+
+  // Chỉ đánh giá chu kỳ quan sát được khi trang đang mở.
+  useEffect(() => {
+    const stamp = Date.parse(data?.sampled_at || '');
+    const pumpKnown = data?.pump === 'ON' || data?.pump === 'OFF';
+
+    if (!validSoil || !Number.isFinite(stamp) || !pumpKnown) {
+      if (cycle.current) {
+        setWatering({
+          phase: 'interrupted',
+          before: cycle.current.before,
+          after: null,
+        });
+      }
+
+      cycle.current = null;
+      previous.current = null;
+      return;
+    }
+
+    const current = {
+      id: data.sample_id,
+      time: stamp,
+      soil: data.soilMoisture,
+      pump: data.pump,
+    };
+
+    const last = previous.current;
+
+    // SSE có thể gửi lại cùng mẫu để cập nhật tuổi dữ liệu.
+    if (last && current.id && current.id === last.id) return;
+    if (last && current.time < last.time) return;
+
+    const gap = last ? current.time - last.time : 0;
+
+    // Gián đoạn quá lâu: không suy diễn chu kỳ bị bỏ lỡ.
+    if (last && gap > 10000) {
+      if (cycle.current) {
+        setWatering({
+          phase: 'interrupted',
+          before: cycle.current.before,
+          after: null,
+        });
+      }
+
+      cycle.current = null;
+      previous.current = current;
+      return;
+    }
+
+    if (!last) {
+      if (current.pump === 'ON') {
+        cycle.current = {
+          phase: 'pumping',
+          before: null,
+          stoppedAt: null,
+        };
+
+        setWatering({
+          phase: 'pumping',
+          before: null,
+          after: null,
+        });
+      }
+
+      previous.current = current;
+      return;
+    }
+
+    // Dùng mẫu OFF ngay trước khi nhận trạng thái ON.
+    if (last.pump === 'OFF' && current.pump === 'ON') {
+      cycle.current = {
+        phase: 'pumping',
+        before: last.soil,
+        stoppedAt: null,
+      };
+
+      setWatering({
+        phase: 'pumping',
+        before: last.soil,
+        after: null,
+      });
+    }
+
+    const active = cycle.current;
+
+    if (
+      active?.phase === 'pumping' &&
+      current.pump === 'OFF'
+    ) {
+      if (active.before === null) {
+        setWatering({
+          phase: 'interrupted',
+          before: null,
+          after: null,
+        });
+
+        cycle.current = null;
+      } else {
+        active.phase = 'settling';
+        active.stoppedAt = current.time;
+
+        setWatering({
+          phase: 'settling',
+          before: active.before,
+          after: null,
+        });
+      }
+    } else if (
+      active?.phase === 'settling' &&
+      current.pump === 'OFF' &&
+      current.time - active.stoppedAt >= 30000
+    ) {
+      setWatering({
+        phase: 'done',
+        before: active.before,
+        after: current.soil,
+      });
+
+      cycle.current = null;
+    }
+
+    previous.current = current;
+  }, [data, online, validSoil]);
+
+  const number = value =>
+    value.toLocaleString('vi-VN', {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1,
+    });
+
+  const band = moisture === null
+    ? 'Chờ số đo mới'
+    : moisture < 30
+      ? 'Dưới ngưỡng đất khô'
+      : moisture < 60
+        ? 'Trong khoảng 30–60%'
+        : 'Đã đạt ngưỡng chặn tưới';
+
+  const tone = moisture === null
+    ? '#94a3b8'
+    : moisture < 30
+      ? '#fbbf24'
+      : moisture < 60
+        ? '#34d399'
+        : '#38bdf8';
+
+  let report =
+    'Giữ trang mở để theo dõi độ ẩm trước và sau một chu kỳ tưới.';
+
+  if (watering.phase === 'pumping') {
+    report = watering.before === null
+      ? 'Bơm đang chạy. Chưa có mẫu trước tưới để so sánh.'
+      : `Bơm đang chạy. Độ ẩm trước tưới: ${number(watering.before)}%.`;
+  } else if (watering.phase === 'settling') {
+    report =
+      'Đang chờ mẫu đo sau khi bơm dừng ít nhất 30 giây để quan sát nước thấm.';
+  } else if (watering.phase === 'interrupted') {
+    report =
+      'Chưa đủ dữ liệu liên tục để đánh giá chu kỳ tưới này.';
+  } else if (watering.phase === 'done') {
+    const delta = watering.after - watering.before;
+    const change = Math.abs(delta) < 0.05
+      ? 'Chưa thay đổi ở mức hiển thị'
+      : `${delta > 0 ? 'Tăng' : 'Giảm'} ${
+          number(Math.abs(delta))
+        } điểm phần trăm`;
+
+    report =
+      `${number(watering.before)}% → ${number(watering.after)}%. ` +
+      `${change} sau chu kỳ vừa quan sát.`;
+  }
+
+  return (
+    <section
+      className={`pot-widget garden-card ${
+        pumping ? 'pot-is-pumping' : ''
+      }`}
+      style={{
+        '--pot-angle': `${angle}deg`,
+        '--pot-accent': tone,
+        '--pot-soil': moisture === null
+          ? '#665044'
+          : `hsl(27, 43%, ${40 - moisture * 0.2}%)`,
+      }}
+      aria-label="Chậu cây và độ ẩm đất trực tiếp"
+    >
+      <style>{`
+        .pot-widget {
+          overflow: hidden;
+          padding: 25px;
+          margin-bottom: 24px;
+          color: #e2e8f0;
+          background:
+            radial-gradient(ellipse at 22% 40%, #10392e80, transparent 65%),
+            linear-gradient(145deg, #13202c, #0b1420);
+        }
+
+        .pot-widget * { box-sizing: border-box; }
+
+        .pot-heading {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 14px;
+          flex-wrap: wrap;
+        }
+
+        .pot-heading small {
+          color: #6ee7b7;
+          font-size: 10px;
+          font-weight: 800;
+          letter-spacing: 2px;
+        }
+
+        .pot-heading h2 {
+          margin: 7px 0 0;
+          font-size: 24px;
+          color: #f8fafc;
+        }
+
+        .pot-badge {
+          padding: 8px 12px;
+          border-radius: 999px;
+          border: 1px solid #334155;
+          background: #0f172a;
+          font-size: 11px;
+          color: #cbd5e1;
+        }
+
+        .pot-is-pumping .pot-badge {
+          border-color: #0e7490;
+          color: #67e8f9;
+        }
+
+        .pot-body {
+          display: grid;
+          grid-template-columns: minmax(200px, 1fr) minmax(180px, 1fr);
+          gap: 22px;
+          align-items: center;
+          margin-top: 15px;
+        }
+
+        .pot-scene {
+          height: 315px;
+          position: relative;
+          perspective: 850px;
+          isolation: isolate;
+        }
+
+        .pot-ground {
+          position: absolute;
+          width: 210px;
+          height: 42px;
+          left: calc(50% - 105px);
+          bottom: 13px;
+          border-radius: 50%;
+          background: #0008;
+          filter: blur(13px);
+        }
+
+        .pot-model {
+          position: absolute;
+          width: 200px;
+          height: 290px;
+          left: calc(50% - 100px);
+          bottom: 18px;
+          transform-style: preserve-3d;
+          transform: rotateY(var(--pot-angle));
+          transition: transform .2s ease;
+        }
+
+        .pot-container {
+          position: absolute;
+          left: 24px;
+          bottom: 0;
+          width: 152px;
+          height: 132px;
+          border-radius: 12px 12px 53px 53px / 12px 12px 25px 25px;
+          background:
+            linear-gradient(90deg,
+              #076451 0%, #10b981 24%, #6ee7b7 42%,
+              #12aa7b 67%, #064e3b 100%);
+          box-shadow:
+            inset 0 -12px 18px #022c224d,
+            inset 3px 0 5px #d1fae54d,
+            12px 16px 24px #0005;
+        }
+
+        .pot-container::after {
+          content: 'SMART GARDEN';
+          position: absolute;
+          top: 65px;
+          left: 0;
+          right: 0;
+          text-align: center;
+          color: #ecfdf5;
+          letter-spacing: 2px;
+          font-size: 9px;
+          font-weight: 800;
+          opacity: .85;
+        }
+
+        .pot-rim {
+          position: absolute;
+          width: 174px;
+          height: 57px;
+          left: 13px;
+          bottom: 105px;
+          border-radius: 50%;
+          background: linear-gradient(140deg, #a7f3d0, #059669 65%, #065f46);
+          box-shadow: 0 7px 0 #047857, 0 11px 9px #0004;
+        }
+
+        .pot-earth {
+          position: absolute;
+          inset: 9px 12px 10px;
+          border-radius: 50%;
+          background:
+            radial-gradient(circle at 30% 40%, #d6b28b 0 1px, transparent 2px),
+            radial-gradient(circle at 65% 65%, #d6b28b 0 1px, transparent 2px),
+            var(--pot-soil);
+          background-size: 25px 19px, 31px 23px, auto;
+          box-shadow: inset 0 7px 10px #0007;
+          transition: background-color .5s ease;
+        }
+
+        .pot-plant {
+          position: absolute;
+          width: 150px;
+          height: 175px;
+          left: 25px;
+          bottom: 128px;
+          transform: translateZ(12px);
+        }
+
+        .pot-stem {
+          position: absolute;
+          width: 9px;
+          height: 142px;
+          bottom: 0;
+          left: 71px;
+          border-radius: 8px;
+          background: linear-gradient(90deg, #14532d, #86efac, #15803d);
+          transform: rotate(-3deg);
+        }
+
+        .pot-leaf {
+          position: absolute;
+          width: 71px;
+          height: 34px;
+          background: linear-gradient(145deg, #a3e635, #22c55e 42%, #166534);
+          border-radius: 4px 90% 5px 90%;
+          box-shadow: inset 0 -3px 4px #14532d70, 3px 6px 7px #0002;
+        }
+
+        .pot-leaf::after {
+          content: '';
+          position: absolute;
+          width: 80%;
+          height: 1px;
+          left: 10%;
+          top: 50%;
+          background: #bbf7d080;
+          transform: rotate(18deg);
+        }
+
+        .pot-leaf.l1 { left: 6px; bottom: 34px; transform: rotate(15deg); }
+        .pot-leaf.l2 { left: 73px; bottom: 54px; transform: scaleX(-1) rotate(12deg); }
+        .pot-leaf.l3 { left: 10px; bottom: 92px; transform: rotate(32deg) scale(.88); }
+        .pot-leaf.l4 { left: 66px; bottom: 115px; transform: scaleX(-1) rotate(35deg) scale(.8); }
+
+        .pot-rain {
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+          z-index: 5;
+        }
+
+        .pot-rain i {
+          position: absolute;
+          top: 75px;
+          width: 5px;
+          height: 14px;
+          border-radius: 60% 60% 70% 70%;
+          background: linear-gradient(#cffafe, #0ea5e9);
+          opacity: 0;
+          animation: pot-drop .85s linear infinite;
+        }
+
+        @keyframes pot-drop {
+          0% { transform: translateY(-10px); opacity: 0; }
+          20% { opacity: .95; }
+          100% { transform: translateY(100px); opacity: 0; }
+        }
+
+        .pot-reading-label {
+          color: #94a3b8;
+          font-size: 13px;
+        }
+
+        .pot-number {
+          margin: 6px 0;
+          font-size: clamp(38px, 5vw, 58px);
+          font-weight: 800;
+          line-height: 1.2;
+          color: var(--pot-accent);
+          font-variant-numeric: tabular-nums;
+        }
+
+        .pot-number span {
+          font-size: 19px;
+          margin-left: 5px;
+        }
+
+        .pot-band {
+          color: var(--pot-accent);
+          font-size: 12px;
+          margin-bottom: 22px;
+        }
+
+        .pot-meter {
+          height: 12px;
+          position: relative;
+          border-radius: 20px;
+          background: #1e293b;
+        }
+
+        .pot-meter-fill {
+          display: block;
+          height: 100%;
+          border-radius: inherit;
+          background: var(--pot-accent);
+          transition: width .45s ease;
+        }
+
+        .pot-meter-mark {
+          position: absolute;
+          top: -4px;
+          height: 20px;
+          width: 2px;
+          background: #e2e8f0;
+        }
+
+        .pot-meter-labels {
+          position: relative;
+          height: 24px;
+          margin-top: 7px;
+          color: #94a3b8;
+          font-size: 10px;
+        }
+
+        .pot-meter-labels span {
+          position: absolute;
+          transform: translateX(-50%);
+        }
+
+        .pot-limits {
+          display: grid;
+          gap: 7px;
+          color: #cbd5e1;
+          font-size: 11px;
+          line-height: 1.6;
+        }
+
+        .pot-rotate {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 12px;
+          font-size: 11px;
+          color: #94a3b8;
+          margin-top: 3px;
+        }
+
+        .pot-rotate input {
+          width: 130px;
+          accent-color: #34d399;
+        }
+
+        .pot-report {
+          margin-top: 20px;
+          padding: 15px;
+          border: 1px solid #334155;
+          border-radius: 15px;
+          background: #0f172a99;
+          font-size: 12px;
+          line-height: 1.8;
+        }
+
+        .pot-report strong { color: #a7f3d0; }
+        .pot-report p { margin: 5px 0 0; color: #cbd5e1; }
+
+        .pot-note {
+          margin-top: 12px;
+          color: #94a3b8;
+          font-size: 10px;
+          line-height: 1.8;
+        }
+
+        @media (max-width: 600px) {
+          .pot-widget { padding: 20px 16px; }
+          .pot-body { grid-template-columns: 1fr; gap: 15px; }
+          .pot-scene { height: 305px; }
+          .pot-reading { text-align: center; }
+          .pot-limits { text-align: left; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .pot-widget * {
+            animation: none !important;
+            transition: none !important;
+          }
+          .pot-rain i { opacity: .7; }
+        }
+      `}</style>
+
+      <div className="pot-heading">
+        <div>
+          <small>LIVE PLANT · ESP32</small>
+          <h2>Chậu cây của bạn</h2>
+        </div>
+
+        <span className="pot-badge">
+          {!online
+            ? 'Chờ kết nối'
+            : pumping
+              ? 'Bơm đang chạy'
+              : waterMissing
+                ? 'Cần bổ sung nước'
+                : 'Đang theo dõi'}
+        </span>
+      </div>
+
+      <div className="pot-body">
+        <div>
+          <div className="pot-scene" aria-hidden="true">
+            <div className="pot-ground" />
+
+            <div className="pot-model">
+              <div className="pot-container" />
+
+              <div className="pot-rim">
+                <div className="pot-earth" />
+              </div>
+
+              <div className="pot-plant">
+                <div className="pot-stem" />
+                <div className="pot-leaf l1" />
+                <div className="pot-leaf l2" />
+                <div className="pot-leaf l3" />
+                <div className="pot-leaf l4" />
+              </div>
+
+              {pumping && (
+                <div className="pot-rain">
+                  {Array.from({ length: 7 }, (_, index) => (
+                    <i
+                      key={index}
+                      style={{
+                        left: `${44 + index * 17}px`,
+                        animationDelay: `${-index * 0.12}s`,
+                      }}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <label className="pot-rotate">
+            Xoay chậu
+            <input
+              type="range"
+              min="-35"
+              max="35"
+              value={angle}
+              onChange={event => setAngle(Number(event.target.value))}
+              aria-label="Góc nhìn chậu cây"
+            />
+          </label>
+        </div>
+
+        <div className="pot-reading">
+          <div className="pot-reading-label">
+            Độ ẩm đất hiện tại
+          </div>
+
+          <div className="pot-number">
+            {moisture === null ? '—' : number(moisture)}
+            <span>%</span>
+          </div>
+
+          <div className="pot-band">{band}</div>
+
+          <div
+            className="pot-meter"
+            role="meter"
+            aria-label="Độ ẩm đất"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={moisture ?? undefined}
+            aria-valuetext={
+              moisture === null ? 'Chưa có số đo mới' : `${number(moisture)}%`
+            }
+          >
+            <span
+              className="pot-meter-fill"
+              style={{ width: `${moisture ?? 0}%` }}
+            />
+            <i className="pot-meter-mark" style={{ left: '30%' }} />
+            <i className="pot-meter-mark" style={{ left: '60%' }} />
+          </div>
+
+          <div className="pot-meter-labels">
+            <span style={{ left: '0%', transform: 'none' }}>0</span>
+            <span style={{ left: '30%' }}>30</span>
+            <span style={{ left: '60%' }}>60</span>
+            <span style={{ right: 0, transform: 'none' }}>100%</span>
+          </div>
+
+          <div className="pot-limits">
+            <div>🟡 Dưới 30%: ngưỡng đất khô.</div>
+            <div>🟢 Từ 30% đến dưới 60%: khoảng giữa hai ngưỡng.</div>
+            <div>🔵 Từ 60%: chặn/dừng tưới theo cấu hình.</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="pot-report" role="status">
+        <strong>
+          {watering.phase === 'done'
+            ? 'Kết quả chu kỳ gần nhất đã quan sát'
+            : 'Theo dõi sau tưới'}
+        </strong>
+        <p>{report}</p>
+      </div>
+
+      <p className="pot-note">
+        Hình cây là minh họa, không đánh giá sức khỏe thực tế.
+        {' Phần trăm là độ ẩm đất, không phải lượng nước còn trong bình.'}
+        {' Hiệu ứng tưới dựa trên trạng thái bơm, không xác nhận lưu lượng nước.'}
+        {' Mốc 30% và 60% là cấu hình hiện tại của kit.'}
+      </p>
+    </section>
+  );
+}
+
 export default function App() {
   const [snapshot, setSnapshot] = useState(null);
   const [apiError, setApiError] = useState('');
@@ -348,8 +1025,6 @@ export default function App() {
         }
     }
 
-    // Tự phục hồi: lỗi thoáng qua không xóa dữ liệu đang hiển thị; chỉ báo lỗi sau 3 lần liên tiếp,
-    // và luôn tự thử lại (giãn dần 2s -> 10s) cho tới khi máy chủ trả lời lại.
     let failures = 0;
     let busy = false;
 
@@ -387,9 +1062,6 @@ export default function App() {
     poll();
     const tick = setInterval(() => setClock(Date.now()), 1000);
 
-    // Nhận bản tin ngay khi ESP32 gửi (SSE). Polling vẫn chạy làm dự phòng.
-    // EventSource tự nối lại khi mất kết nối thoáng qua, nhưng nếu máy chủ trả 502/503
-    // (đang khởi động lại) nó đóng hẳn -> ta tự tạo lại với thời gian chờ tăng dần.
     let source = null;
     let sseTimer;
     let sseFails = 0;
@@ -410,7 +1082,6 @@ export default function App() {
           try {
             applyLatest(JSON.parse(event.data));
           } catch {
-            /* bỏ qua bản tin lỗi, polling sẽ bù */
           }
         };
 
@@ -432,7 +1103,6 @@ export default function App() {
 
     connectSSE();
 
-    // Tab nền bị trình duyệt làm chậm timer; quay lại tab hoặc có mạng lại thì lấy dữ liệu ngay
     function wake() {
       if (document.visibilityState === 'visible') {
         failures = 0;
@@ -1052,6 +1722,11 @@ export default function App() {
 
           <div className="garden-workspace">
             <div className="garden-main">
+              <PlantPot3D
+                data={data}
+                online={online}
+              />
+
               <nav className="garden-tabs" aria-label="Nội dung theo dõi">
                 {TABS.map(([key, icon, label]) => (
                   <button
