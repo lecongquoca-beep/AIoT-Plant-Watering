@@ -26,10 +26,6 @@ const API = (
 
 const DEVICE = import.meta.env.VITE_DEVICE_ID || 'esp32_v1';
 
-// Khóa điều khiển cài sẵn qua biến môi trường VITE_CONTROL_API_KEY.
-// Để trống thì giao diện vẫn hiện ô nhập khóa như cũ.
-const PRESET_API_KEY = (import.meta.env.VITE_CONTROL_API_KEY || '').trim();
-
 const METRICS = [
   {
     key: 'soilMoisture',
@@ -230,7 +226,6 @@ export default function App() {
   const [tab, setTab] = useState('live');
   const [metric, setMetric] = useState('all');
   const [settings, setSettings] = useState(false);
-  const [apiKey, setApiKey] = useState(PRESET_API_KEY);
 
   const [sending, setSending] = useState(false);
   const [command, setCommand] = useState(null);
@@ -604,8 +599,14 @@ export default function App() {
     age !== null &&
     age <= 20;
 
-  const canControl =
-    online && apiKey.trim().length > 0 && !sending;
+  const waterFault =
+    String(data?.fault || '').trim().toUpperCase() === 'NO WATER (FLOAT)';
+
+  const otherFault = Boolean(data?.fault) && !waterFault;
+
+  const lowWater = data?.waterAvailable === false || waterFault;
+
+  const canControl = online && !sending;
 
   const canWater =
     canControl &&
@@ -630,7 +631,6 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': apiKey.trim(),
         },
         body: JSON.stringify({ device_id: DEVICE, ...values }),
       });
@@ -658,16 +658,16 @@ export default function App() {
 
   const wateringReason = !online
     ? 'Chờ dữ liệu mới từ thiết bị.'
-    : !apiKey.trim()
-      ? 'Nhập khóa điều khiển để sử dụng các nút.'
-      : sending
-        ? 'Đang chờ xác nhận từ thiết bị.'
-        : data?.mode !== 'MANUAL'
-          ? 'Chọn Thủ công để sử dụng nút tưới.'
-          : data?.waterAvailable !== true
-            ? 'Bình chưa có nước.'
-            : data?.fault
-              ? `Thiết bị đang lỗi: ${data.fault}`
+    : otherFault
+      ? `Thiết bị cần kiểm tra: ${data.fault}`
+      : lowWater
+        ? 'Bình đang thiếu nước — vui lòng bổ sung nước. Tạm khóa tưới.'
+        : sending
+          ? 'Đang chờ xác nhận từ thiết bị.'
+          : data?.mode !== 'MANUAL'
+            ? 'Chọn Thủ công để sử dụng nút tưới.'
+            : data?.waterAvailable !== true
+              ? 'Chưa xác nhận được nguồn nước.'
               : !Number.isFinite(data?.soilMoisture)
                 ? 'Chưa có số đo độ ẩm đất hợp lệ.'
                 : data.soilMoisture >= 60
@@ -746,6 +746,11 @@ export default function App() {
     aiMessage =
       'Thiết bị hoặc kết nối đang gián đoạn. ' +
       'Dự đoán cũ được tạm ẩn.';
+  } else if (lowWater && !otherFault) {
+    aiTitle = 'Cần bổ sung nước';
+    aiMessage =
+      'Phao đang báo thiếu nước. Vui lòng bổ sung nước; ' +
+      'tưới và dự đoán đang tạm dừng.';
   } else if (data.fault || data.fsm === 'FAULT') {
     aiTitle = 'Thiết bị đang báo lỗi';
     aiMessage = data.fault || backendMessage ||
@@ -769,13 +774,15 @@ export default function App() {
 
   const heroTitle = !online
     ? 'Chờ khu vườn kết nối'
-    : data?.fault
+    : otherFault
       ? 'Thiết bị cần kiểm tra'
-      : data?.pump === 'ON'
-        ? 'Đang chăm sóc khu vườn'
-        : data?.waterAvailable === false
-          ? 'Đã đến lúc bổ sung nước'
-          : 'Khu vườn trong tầm tay';
+      : lowWater
+        ? 'Đã đến lúc bổ sung nước'
+        : data?.fault || data?.fsm === 'FAULT'
+          ? 'Thiết bị cần kiểm tra'
+          : data?.pump === 'ON'
+            ? 'Đang chăm sóc khu vườn'
+            : 'Khu vườn trong tầm tay';
 
   const source = tab === 'history' ? history : samples;
   const overview = metric === 'all';
@@ -944,21 +951,9 @@ export default function App() {
             <section className="garden-card garden-settings">
               <div>
                 <h2>Cài đặt điều khiển</h2>
-                <p>Khóa chỉ giữ trong bộ nhớ trang, không lưu sau khi tải lại.</p>
+                <p>Điều khiển trực tiếp từ web. Bơm chỉ hoạt động khi đủ điều kiện.</p>
                 <p className="garden-api-address">API: {API}</p>
               </div>
-              {!PRESET_API_KEY && (
-              <label className="garden-key">
-                <span>Khóa điều khiển</span>
-                <input
-                  type="password"
-                  autoComplete="off"
-                  value={apiKey}
-                  placeholder="Nhập API key"
-                  onChange={event => setApiKey(event.target.value)}
-                />
-              </label>
-              )}
               <button className="garden-soft-button" onClick={() => setSettings(false)}>
                 Đóng
               </button>
@@ -1011,9 +1006,20 @@ export default function App() {
             </div>
           )}
 
-          {data?.fault && (
+          {online && lowWater && (
+            <div className="garden-alert garden-water-warning" role="status">
+              <Icon name="alert" />
+              <span>
+                Bình đang thiếu nước — vui lòng bổ sung nước.
+                {' Bơm tạm khóa để tránh chạy khô.'}
+              </span>
+            </div>
+          )}
+
+          {data?.fault && otherFault && (
             <div className="garden-alert" role="alert">
-              <Icon name="alert" />Lỗi thiết bị: {data.fault}
+              <Icon name="alert" />
+              <span>Lỗi thiết bị: {data.fault}</span>
             </div>
           )}
 
@@ -1321,7 +1327,6 @@ export default function App() {
               <h2>Chăm sóc cây</h2>
               <p className="garden-control-subtitle">Một thao tác, thêm một chút xanh.</p>
 
-              {/* Khung trạng thái tín hiệu tích hợp */}
               <div className="garden-wifi-box">
                 <div className="garden-wifi-icon">
                   <Icon name="wifi" size={20} />
@@ -1393,25 +1398,6 @@ export default function App() {
                   );
                 })}
               </div>
-
-              {!PRESET_API_KEY && (
-              <label className="garden-key">
-                <span><Icon name="lock" size={16} />Khóa điều khiển</span>
-                <input
-                  type="password"
-                  autoComplete="off"
-                  placeholder="Nhập API key"
-                  value={apiKey}
-                  onChange={event => setApiKey(event.target.value)}
-                />
-              </label>
-              )}
-
-              {!PRESET_API_KEY && (
-              <p className="garden-key-note">
-                Khóa chỉ giữ trong phiên hiện tại và được kiểm tra khi gửi lệnh.
-              </p>
-              )}
 
               <button
                 className="garden-water-button"
@@ -1869,6 +1855,7 @@ const STYLES = `
   
   .garden-alert { display: flex; align-items: center; gap: 12px; padding: 16px 19px; margin-bottom: 18px; border-radius: 15px; background: #450a0a; border: 1px solid #7f1d1d; color: #fca5a5; font-size: 12px; }
   .garden-error { color: #f87171; font-size: 12px; margin-top: 12px !important; }
+  .garden-alert.garden-water-warning { background: #2b2108; border-color: #a16207; color: #facc15; }
   
   .garden-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 28px; padding: 18px 0 3px; color: #64748b; font-size: 10px; border-top: 1px solid #1e293b; }
   .garden-footer > span:first-child { display: flex; align-items: center; gap: 7px; letter-spacing: .8px; font-weight: 700; color: #94a3b8; }
